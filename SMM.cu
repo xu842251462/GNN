@@ -3,6 +3,8 @@
 #include <cstdlib>
 #include <math.h>
 #include <omp.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 // Assertion to check for errors
 #define CUDA_SAFE_CALL(ans) { gpuAssert((ans), __FILE__, __LINE__); }
@@ -25,28 +27,47 @@ inline void gpuAssert(cudaError_t code, char *file, int line, bool abort=true)
 // #define IMUL(a, b) __mul24(a, b)
 #define BLOCK_SIZE 16
 // #define TILE_WIDTH 16
+#define SPARSITY 0.05
 
 typedef float data_t;
 
 void initializeArray1D(float *arr, int len, float seed);
+void initializeSparseMatrixCSR(int *row_offset, int len, int *col_indices, float *values, float seed);
 
 //Md - matrix  
 //Nd - vector
-//Pd - result 
-__global__ void MMK(float* Md, float* Nd, float* Pd)
+//y - result 
+// __global__ void MMK(float* Md, float* Nd, float* y)
+// {
+//     int col = blockDim.x * blockIdx.x + threadIdx.x;
+//     int row = blockDim.y * blockIdx.y + threadIdx.y;
+//     int num_row = SM_ARR_LEN / BLOCK_SIZE;
+//     int k, i;
+//     float sum = 0.0f;
+//     for (i = 0; i < num_row; i++) {
+//         if (col < SM_ARR_LEN || row < SM_ARR_LEN) {
+//             for(k = 0; k < BLOCK_SIZE; k++){
+//                 sum += Md[row * BLOCK_SIZE + k] * Nd[k];
+//             }
+//             y[i] = sum;  
+//         }
+//     }
+// }
+
+__global__ void SpMV(int *row_off, float *val, int *col, float *y, float *x)
 {
-    int col = blockDim.x * blockIdx.x + threadIdx.x;
     int row = blockDim.y * blockIdx.y + threadIdx.y;
-    int num_row = SM_ARR_LEN / BLOCK_SIZE;
-    int k, i;
-    float sum = 0.0f;
-    for (i = 0; i < num_row; i++) {
-        if (col < SM_ARR_LEN || row < SM_ARR_LEN) {
-            for(k = 0; k < BLOCK_SIZE; k++){
-                sum += Md[row * BLOCK_SIZE + k] * Nd[k];
-            }
-            Pd[i] = sum;  
-        }
+    int numOfRows = SM_ARR_LEN / BLOCK_SIZE;
+    int i, j;
+    float sum = 0.0f;                                           
+
+    for (i=0; i < numOfRows; ++i) {
+        if (row < numOfRows) {
+            y[row] = 0.0;
+            for (j=row_off[row]; j<row_off[row+1]; ++j)
+                sum += val[j] * x[col[j]];
+            y[row] = sum;
+        }   
     }
 }
 
@@ -97,17 +118,21 @@ int main(int argc, char **argv){
     float elapsed_gpu;
 
     // Arrays on GPU global memoryc
-    //Md - matrix, Nd - vector, Pd - result matrix
+    //Md - matrix, Nd - vector, y - result matrix
     float *Md;
     float *Nd;
-    float *Pd;
+    float *y;
+    int *row_offset;
+    int *col_indices;
+    float *value;
+    float *x;
 
     // Arrays on the host memory
     float *Md_h;
-    float *Pd_h;
+    float *y_h;
     float *Nd_h;
-    // float *Pd_h_gold;
-    // float *Pd_h_cpu_block;
+    // float *y_h_gold;
+    // float *y_h_cpu_block;
     // int i, errCount = 0, zeroCount = 0;
 
     if (argc > 1) {
@@ -117,6 +142,7 @@ int main(int argc, char **argv){
         arrLen = SM_ARR_LEN * SM_ARR_LEN;
     }
 
+
     printf("Length of the array = %d\n", arrLen);
 
     // Select GPU
@@ -125,26 +151,35 @@ int main(int argc, char **argv){
     // Allocate GPU memory
     size_t allocSize = arrLen * sizeof(float);
     size_t vectorSize = SM_ARR_LEN * sizeof(float);
-    CUDA_SAFE_CALL(cudaMalloc((void **)&Md, allocSize));
-    CUDA_SAFE_CALL(cudaMalloc((void **)&Pd, vectorSize));
-    CUDA_SAFE_CALL(cudaMalloc((void **)&Nd, vectorSize));
+    size_t allocSize_int = (SM_ARR_LEN * SM_ARR_LEN) * sizeof(int);
+    size_t row_offset_size = (SM_ARR_LEN + 1) * sizeof(int);
+    // CUDA_SAFE_CALL(cudaMalloc((void **)&Md, allocSize));
+    CUDA_SAFE_CALL(cudaMalloc((void **)&y, allocSize));
+    // CUDA_SAFE_CALL(cudaMalloc((void **)&Nd, vectorSize));
+    CUDA_SAFE_CALL(cudaMalloc((void **)&row_offset, row_offset_size));
+    CUDA_SAFE_CALL(cudaMalloc((void **)&col_indices, allocSize_int));
+    CUDA_SAFE_CALL(cudaMalloc((void **)&value, allocSize));
+    CUDA_SAFE_CALL(cudaMalloc((void **)&x, allocSize));
 
     // Allocate arrays on host memory
-    Pd_h		           = (float *) malloc(vectorSize);
-    Md_h		           = (float *) malloc(allocSize);
-    Nd_h		           = (float *) malloc(vectorSize);
+    y_h		           = (float *) malloc(allocSize);
+    // Md_h		           = (float *) malloc(allocSize);
+    // Nd_h		           = (float *) malloc(vectorSize);
+    int *row_offset_h = (int *)malloc(row_offset_size);
+    int *col_indices_h = (int *)malloc(allocSize_int);
+    float *values_h = (float *)malloc(allocSize);
+    float *x_h = (float *)malloc(allocSize);
+
 
     // Initialize the host arrays
     printf("\nInitializing the arrays ...");
     // Arrays are initialized with a known seed for reproducability
-    initializeArray1D(Md_h, arrLen, 0.53);
-    initializeArray1D(Nd_h, SM_ARR_LEN, 0.54);
+    // initializeArray1D(Md_h, arrLen, 0.53);
+    //vector 
+    initializeArray1D(x_h, SM_ARR_LEN, 0.54);
+    //sparse matrix
+    initializeSparseMatrixCSR(row_offset_h, SM_ARR_LEN, col_indices_h, values_h, 0.54);
     printf("\t... done\n\n");
-
-
-    struct timespec diff(struct timespec start, struct timespec end);
-    struct timespec time1, time2;
-    struct timespec time_stamp;
 
 
 #if PRINT_TIME
@@ -156,8 +191,16 @@ int main(int argc, char **argv){
 #endif
 
     // Transfer the arrays to the GPU memory
-    CUDA_SAFE_CALL(cudaMemcpy(Md, Md_h, allocSize, cudaMemcpyHostToDevice));
-    CUDA_SAFE_CALL(cudaMemcpy(Nd, Nd_h, vectorSize, cudaMemcpyHostToDevice));
+    // CUDA_SAFE_CALL(cudaMemcpy(Md, Md_h, allocSize, cudaMemcpyHostToDevice));
+    // CUDA_SAFE_CALL(cudaMemcpy(Nd, Nd_h, vectorSize, cudaMemcpyHostToDevice));
+
+    CUDA_SAFE_CALL(cudaMemcpy(row_offset, row_offset_h, row_offset_size, cudaMemcpyHostToDevice));
+    CUDA_SAFE_CALL(cudaMemcpy(value, values_h, allocSize, cudaMemcpyHostToDevice));
+    CUDA_SAFE_CALL(cudaMemcpy(col_indices, col_indices_h, allocSize_int, cudaMemcpyHostToDevice));
+    CUDA_SAFE_CALL(cudaMemcpy(x, x_h, allocSize, cudaMemcpyHostToDevice));
+    CUDA_SAFE_CALL(cudaMemcpy(y, y_h, allocSize, cudaMemcpyHostToDevice));
+
+
     cudaEventCreate(&start2);
     cudaEventCreate(&stop2);
     cudaEventRecord(start2, 0);
@@ -165,8 +208,8 @@ int main(int argc, char **argv){
     dim3 dimGrid(SM_ARR_LEN, SM_ARR_LEN);
     dim3 dimBlock(BLOCK_SIZE, BLOCK_SIZE);
     // Launch the kernel
-    //Md - matrix, Nd - vector, Pd - result 
-    MMK<<<dimGrid, dimBlock>>>(Md, Nd, Pd);
+    //Md - matrix, Nd - vector, y - result 
+    SpMV<<<dimGrid, dimBlock>>>(row_offset, value, col_indices, y, x);
 
     // timer for kernel execution
     cudaEventRecord(stop2,0);
@@ -180,7 +223,11 @@ int main(int argc, char **argv){
     CUDA_SAFE_CALL(cudaPeekAtLastError());
 
     // Transfer the results back to the host
-    CUDA_SAFE_CALL(cudaMemcpy(Pd_h, Pd, vectorSize, cudaMemcpyDeviceToHost));
+    CUDA_SAFE_CALL(cudaMemcpy(y_h, y, allocSize, cudaMemcpyDeviceToHost));
+    CUDA_SAFE_CALL(cudaMemcpy(col_indices_h, col_indices, allocSize_int, cudaMemcpyDeviceToHost));
+    CUDA_SAFE_CALL(cudaMemcpy(row_offset_h, row_offset, row_offset_size, cudaMemcpyDeviceToHost));
+    CUDA_SAFE_CALL(cudaMemcpy(values_h, value, allocSize, cudaMemcpyDeviceToHost));
+    CUDA_SAFE_CALL(cudaMemcpy(x_h, x, allocSize, cudaMemcpyDeviceToHost));
 
 #if PRINT_TIME
     // Stop and destroy the timer
@@ -192,19 +239,22 @@ int main(int argc, char **argv){
     cudaEventDestroy(stop);
 #endif
 
-    // printf("\nCompare: %d\n\n\n",compare(Pd_h,Pd_h_gold));
-    // printf("\nBiggest Error: %f\n\n\n",errorCal(Pd_h,Pd_h_gold));
+    // printf("\nCompare: %d\n\n\n",compare(y_h,y_h_gold));
+    // printf("\nBiggest Error: %f\n\n\n",errorCal(y_h,y_h_gold));
 
     // Free-up device and host memory
-    CUDA_SAFE_CALL(cudaFree(Pd));
-    CUDA_SAFE_CALL(cudaFree(Md));
-    CUDA_SAFE_CALL(cudaFree(Nd));
+    CUDA_SAFE_CALL(cudaFree(y));
+    CUDA_SAFE_CALL(cudaFree(value));
+    CUDA_SAFE_CALL(cudaFree(x));
+    CUDA_SAFE_CALL(cudaFree(col_indices));
+    CUDA_SAFE_CALL(cudaFree(row_offset));
 
 
-    free(Pd_h);
-    free(Md_h);
-    free(Nd_h);
-    // free(Pd_h_gold);
+    free(y_h);
+    free(values_h);
+    free(col_indices_h);
+    free(row_offset_h);
+    free(x_h);
 
     return 0;
 }
@@ -233,3 +283,25 @@ void initializeArray1D(float *arr, int len, float seed) {
         arr[i] = randNum;
     }
 }
+
+void initializeSparseMatrixCSR(int *row_offset, int len, int *col_indices, float *values, float seed) {
+    //num of non-zero elements
+    int nnz = 0;
+    int i, j;
+   
+    srand(seed);
+
+    for (i = 0; i < len; ++i) {
+        // row_offset[i] = row_offset[i - 1];
+        for (int j = 0; j < len; ++j) {
+            if ((float)rand() / RAND_MAX < SPARSITY) {
+                col_indices[nnz] = j;
+                values[nnz] = (float)rand() / RAND_MAX;
+                nnz++;
+                // row_offset[nnz]++;
+            }
+        }
+        row_offset[i + 1] = nnz;
+    }
+}
+
