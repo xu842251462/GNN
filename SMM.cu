@@ -25,9 +25,10 @@ inline void gpuAssert(cudaError_t code, char *file, int line, bool abort=true)
 #define GIG                     1000000000
 // #define CPG                     3.07
 // #define IMUL(a, b) __mul24(a, b)
-#define BLOCK_SIZE 16
+#define BLOCK_SIZE 128
 // #define TILE_WIDTH 16
 #define SPARSITY 0.05
+#define FULL_MASK 0xffffffff
 
 typedef float data_t;
 
@@ -54,20 +55,95 @@ void initializeSparseMatrixCSR(int *row_offset, int len, int *col_indices, float
 //     }
 // }
 
-__global__ void SpMV(int *row_off, float *val, int *col, float *y, float *x)
+__device__ float warp_reduce(float val) 
+{
+    for (int offset = warpSize / 2; offset > 0; offset /= 2) 
+        val += __shfl_down_sync (FULL_MASK, val, offset);
+    return val;
+}
+
+// __global__ void SpMV(int *row_off, float *val, int *col, float *y, float *x)
+// {
+//     int row = blockDim.y * blockIdx.y + threadIdx.y;
+//     int numOfRows = SM_ARR_LEN / BLOCK_SIZE;
+//     int i, j;
+//     float sum = 0.0f;                                           
+
+//     for (i=0; i < numOfRows; ++i) {
+//         if (row < numOfRows) {
+//             y[row] = 0.0;
+//             for (j=row_off[row]; j<row_off[row+1]; ++j)
+//                 sum += val[j] * x[col[j]];
+//             y[row] = sum;
+//         }   
+//     }
+// }
+
+__global__ void edge_softmax_forward(int *row_off, float *val, float *y)
 {
     int row = blockDim.y * blockIdx.y + threadIdx.y;
     int numOfRows = SM_ARR_LEN / BLOCK_SIZE;
-    int i, j;
-    float sum = 0.0f;                                           
+    int i, j, k, l;
+    float max_score, exp_value, sum;                                         
 
     for (i=0; i < numOfRows; ++i) {
         if (row < numOfRows) {
             y[row] = 0.0;
-            for (j=row_off[row]; j<row_off[row+1]; ++j)
-                sum += val[j] * x[col[j]];
-            y[row] = sum;
+            //find max edge value
+            for (j=row_off[row]; j<row_off[row+1]; ++j){
+                max_score = max(max_score, val[j]);
+            }
+            //update edge value && find sum of exp
+            for (k=row_off[row]; k<row_off[row+1]; ++k) {
+                val[k] = val[k] - max_score;
+                exp_value = exp(val[k]);
+                sum += exp_value;
+            }
+            
+            for (l=row_off[row]; l<row_off[row+1]; ++l) {
+                y[row] = exp_value / sum;
+            }
         }   
+    }
+}
+
+__global__ void edge_softmax_forward_warp(int *row_off, float *val, float *y)
+{
+    int threadId = blockDim.y * blockIdx.y + threadIdx.y;
+    int numOfRows = SM_ARR_LEN / BLOCK_SIZE;
+    int i, j, k, l;
+    float max_score; 
+    float exp_value; 
+    float sum, res;  
+    int warp_id = threadId / 32;
+    int lane = threadId % 32; 
+    int row = warp_id; //one warp per row
+
+    for (i=0; i < numOfRows; ++i) {
+        if (row < numOfRows) {
+            y[row] = 0.0;
+            for (j=row_off[row]; j<row_off[row+1]; ++j){
+                max_score = max(max_score, val[j]);
+            }
+               
+            for (k=row_off[row]; k<row_off[row+1]; ++k) {
+                val[k] = val[k] - max_score;
+                exp_value = exp(val[k]);
+                sum += exp_value;
+            }
+
+            //inter communication in warp
+            res = warp_reduce(sum);
+
+            if (lane == 0 && row < numOfRows) {
+                sum = res;
+            }
+                
+            for (l=row_off[row]; l<row_off[row+1]; ++l) {
+                y[row] = exp_value / sum;
+            }
+        }   
+        
     }
 }
 
@@ -131,9 +207,6 @@ int main(int argc, char **argv){
     float *Md_h;
     float *y_h;
     float *Nd_h;
-    // float *y_h_gold;
-    // float *y_h_cpu_block;
-    // int i, errCount = 0, zeroCount = 0;
 
     if (argc > 1) {
         arrLen  = atoi(argv[1]);
@@ -154,12 +227,12 @@ int main(int argc, char **argv){
     size_t allocSize_int = (SM_ARR_LEN * SM_ARR_LEN) * sizeof(int);
     size_t row_offset_size = (SM_ARR_LEN + 1) * sizeof(int);
     // CUDA_SAFE_CALL(cudaMalloc((void **)&Md, allocSize));
-    CUDA_SAFE_CALL(cudaMalloc((void **)&y, allocSize));
+    CUDA_SAFE_CALL(cudaMalloc((void **)&y, vectorSize));
     // CUDA_SAFE_CALL(cudaMalloc((void **)&Nd, vectorSize));
     CUDA_SAFE_CALL(cudaMalloc((void **)&row_offset, row_offset_size));
-    CUDA_SAFE_CALL(cudaMalloc((void **)&col_indices, allocSize_int));
+    // CUDA_SAFE_CALL(cudaMalloc((void **)&col_indices, allocSize_int));
     CUDA_SAFE_CALL(cudaMalloc((void **)&value, allocSize));
-    CUDA_SAFE_CALL(cudaMalloc((void **)&x, allocSize));
+    // CUDA_SAFE_CALL(cudaMalloc((void **)&x, allocSize));
 
     // Allocate arrays on host memory
     y_h		           = (float *) malloc(allocSize);
@@ -168,7 +241,7 @@ int main(int argc, char **argv){
     int *row_offset_h = (int *)malloc(row_offset_size);
     int *col_indices_h = (int *)malloc(allocSize_int);
     float *values_h = (float *)malloc(allocSize);
-    float *x_h = (float *)malloc(allocSize);
+    // float *x_h = (float *)malloc(allocSize);
 
 
     // Initialize the host arrays
@@ -176,7 +249,7 @@ int main(int argc, char **argv){
     // Arrays are initialized with a known seed for reproducability
     // initializeArray1D(Md_h, arrLen, 0.53);
     //vector 
-    initializeArray1D(x_h, SM_ARR_LEN, 0.54);
+    // initializeArray1D(x_h, SM_ARR_LEN, 0.54);
     //sparse matrix
     initializeSparseMatrixCSR(row_offset_h, SM_ARR_LEN, col_indices_h, values_h, 0.54);
     printf("\t... done\n\n");
@@ -196,8 +269,8 @@ int main(int argc, char **argv){
 
     CUDA_SAFE_CALL(cudaMemcpy(row_offset, row_offset_h, row_offset_size, cudaMemcpyHostToDevice));
     CUDA_SAFE_CALL(cudaMemcpy(value, values_h, allocSize, cudaMemcpyHostToDevice));
-    CUDA_SAFE_CALL(cudaMemcpy(col_indices, col_indices_h, allocSize_int, cudaMemcpyHostToDevice));
-    CUDA_SAFE_CALL(cudaMemcpy(x, x_h, allocSize, cudaMemcpyHostToDevice));
+    // CUDA_SAFE_CALL(cudaMemcpy(col_indices, col_indices_h, allocSize_int, cudaMemcpyHostToDevice));
+    // CUDA_SAFE_CALL(cudaMemcpy(x, x_h, allocSize, cudaMemcpyHostToDevice));
     CUDA_SAFE_CALL(cudaMemcpy(y, y_h, allocSize, cudaMemcpyHostToDevice));
 
 
@@ -208,8 +281,7 @@ int main(int argc, char **argv){
     dim3 dimGrid(SM_ARR_LEN, SM_ARR_LEN);
     dim3 dimBlock(BLOCK_SIZE, BLOCK_SIZE);
     // Launch the kernel
-    //Md - matrix, Nd - vector, y - result 
-    SpMV<<<dimGrid, dimBlock>>>(row_offset, value, col_indices, y, x);
+    edge_softmax_forward_warp<<<dimGrid, dimBlock>>>(row_offset, value, y);
 
     // timer for kernel execution
     cudaEventRecord(stop2,0);
@@ -224,10 +296,10 @@ int main(int argc, char **argv){
 
     // Transfer the results back to the host
     CUDA_SAFE_CALL(cudaMemcpy(y_h, y, allocSize, cudaMemcpyDeviceToHost));
-    CUDA_SAFE_CALL(cudaMemcpy(col_indices_h, col_indices, allocSize_int, cudaMemcpyDeviceToHost));
+    // CUDA_SAFE_CALL(cudaMemcpy(col_indices_h, col_indices, allocSize_int, cudaMemcpyDeviceToHost));
     CUDA_SAFE_CALL(cudaMemcpy(row_offset_h, row_offset, row_offset_size, cudaMemcpyDeviceToHost));
     CUDA_SAFE_CALL(cudaMemcpy(values_h, value, allocSize, cudaMemcpyDeviceToHost));
-    CUDA_SAFE_CALL(cudaMemcpy(x_h, x, allocSize, cudaMemcpyDeviceToHost));
+    // CUDA_SAFE_CALL(cudaMemcpy(x_h, x, allocSize, cudaMemcpyDeviceToHost));
 
 #if PRINT_TIME
     // Stop and destroy the timer
@@ -245,16 +317,16 @@ int main(int argc, char **argv){
     // Free-up device and host memory
     CUDA_SAFE_CALL(cudaFree(y));
     CUDA_SAFE_CALL(cudaFree(value));
-    CUDA_SAFE_CALL(cudaFree(x));
-    CUDA_SAFE_CALL(cudaFree(col_indices));
+    // CUDA_SAFE_CALL(cudaFree(x));
+    // CUDA_SAFE_CALL(cudaFree(col_indices));
     CUDA_SAFE_CALL(cudaFree(row_offset));
 
 
     free(y_h);
     free(values_h);
-    free(col_indices_h);
+    // free(col_indices_h);
     free(row_offset_h);
-    free(x_h);
+    // free(x_h);
 
     return 0;
 }
