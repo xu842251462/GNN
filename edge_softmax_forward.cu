@@ -53,7 +53,7 @@ void initializeSparseMatrixCSR(int *row_offset, int len, int *col_indices, float
 //             y[i] = sum;  
 //         }
 //     }
-// }
+// } in the <math.h> library,
 
 __device__ float warp_reduce(float val) 
 {
@@ -79,29 +79,31 @@ __device__ float warp_reduce(float val)
 //     }
 // }
 
-__global__ void edge_softmax_forward(int *row_off, float *val, float *y)
+__global__ void edge_softmax_forward(int *row_off, float *val)
 {
     int row = blockDim.x * blockIdx.x + threadIdx.x;
     int numOfRows = SM_ARR_LEN / BLOCK_SIZE;
     int i, j, k, l;
-    float max_score, exp_value, sum;                                         
+    float max_score = -INFINITY, exp_value, sum = 0.0f; 
+    int start = row_off[row], end = row_off[row + 1];        
+    float *y;                               
 
     for (i=0; i < numOfRows; ++i) {
         if (row < numOfRows) {
             y[row] = 0.0;
             //find max edge value
-            for (j=row_off[row]; j<row_off[row+1]; j += 1){
+            for (j=start; j<end; ++j){
                 max_score = max(max_score, val[j]);
             }
             //update edge value && find sum of exp
-            for (k=row_off[row]; k<row_off[row+1]; ++k) {
-                val[k] = val[k] - max_score;
-                exp_value = exp(val[k]);
+            for (k=start; k<end; ++k) {
+                y[row] = val[k] - max_score;
+                exp_value = exp(y[row]);
                 sum += exp_value;
             }
             
-            for (l=row_off[row]; l<row_off[row+1]; ++l) {
-                y[row] = exp_value / sum;
+            for (l=start; l<end; ++l) {
+                val[row] = exp_value / sum;
             }
         }   
     }
@@ -118,15 +120,16 @@ __global__ void edge_softmax_forward_warp(int *row_off, float *val, float *y)
     int warp_id = threadId / 32;
     int lane = threadId % 32; 
     int row = warp_id; //one warp per row
+    int start = row_off[row], end = row_off[row + 1];    
 
     for (i=0; i < numOfRows; ++i) {
         if (row < numOfRows) {
             y[row] = 0.0;
-            for (j=row_off[row]; j<row_off[row+1]; j += 32){
+            for (j=start; j<end; j += 32){
                 max_score = max(max_score, val[j]);
             }
                
-            for (k=row_off[row]; k<row_off[row+1]; k += 32) {
+            for (k=start; k<end; k += 32) {
                 val[k] = val[k] - max_score;
                 exp_value = exp(val[k]);
                 sum += exp_value;
@@ -139,7 +142,7 @@ __global__ void edge_softmax_forward_warp(int *row_off, float *val, float *y)
                 sum = res;
             }
                 
-            for (l=row_off[row]; l<row_off[row+1]; l += 32) {
+            for (l=start; l<end; l += 32) {
                 y[row] = exp_value / sum;
             }
         }   
@@ -227,7 +230,7 @@ int main(int argc, char **argv){
     size_t allocSize_int = (SM_ARR_LEN * SM_ARR_LEN) * sizeof(int);
     size_t row_offset_size = (SM_ARR_LEN + 1) * sizeof(int);
     // CUDA_SAFE_CALL(cudaMalloc((void **)&Md, allocSize));
-    CUDA_SAFE_CALL(cudaMalloc((void **)&y, vectorSize));
+    // CUDA_SAFE_CALL(cudaMalloc((void **)&y, vectorSize));
     // CUDA_SAFE_CALL(cudaMalloc((void **)&Nd, vectorSize));
     CUDA_SAFE_CALL(cudaMalloc((void **)&row_offset, row_offset_size));
     // CUDA_SAFE_CALL(cudaMalloc((void **)&col_indices, allocSize_int));
@@ -235,7 +238,7 @@ int main(int argc, char **argv){
     // CUDA_SAFE_CALL(cudaMalloc((void **)&x, allocSize));
 
     // Allocate arrays on host memory
-    y_h		           = (float *) malloc(vectorSize);
+    // y_h		           = (float *) malloc(vectorSize);
     // Md_h		           = (float *) malloc(allocSize);
     // Nd_h		           = (float *) malloc(vectorSize);
     int *row_offset_h = (int *)malloc(row_offset_size);
@@ -271,7 +274,7 @@ int main(int argc, char **argv){
     CUDA_SAFE_CALL(cudaMemcpy(value, values_h, allocSize, cudaMemcpyHostToDevice));
     // CUDA_SAFE_CALL(cudaMemcpy(col_indices, col_indices_h, allocSize_int, cudaMemcpyHostToDevice));
     // CUDA_SAFE_CALL(cudaMemcpy(x, x_h, allocSize, cudaMemcpyHostToDevice));
-    CUDA_SAFE_CALL(cudaMemcpy(y, y_h, vectorSize, cudaMemcpyHostToDevice));
+    // CUDA_SAFE_CALL(cudaMemcpy(y, y_h, vectorSize, cudaMemcpyHostToDevice));
 
 
     cudaEventCreate(&start2);
@@ -281,7 +284,7 @@ int main(int argc, char **argv){
     dim3 dimGrid(SM_ARR_LEN, SM_ARR_LEN);
     dim3 dimBlock(BLOCK_SIZE, BLOCK_SIZE);
     // Launch the kernel
-    edge_softmax_forward_warp<<<dimGrid, dimBlock>>>(row_offset, value, y);
+    edge_softmax_forward<<<dimGrid, dimBlock>>>(row_offset, value);
 
     // timer for kernel execution
     cudaEventRecord(stop2,0);
@@ -295,7 +298,7 @@ int main(int argc, char **argv){
     CUDA_SAFE_CALL(cudaPeekAtLastError());
 
     // Transfer the results back to the host
-    CUDA_SAFE_CALL(cudaMemcpy(y_h, y, vectorSize, cudaMemcpyDeviceToHost));
+    // CUDA_SAFE_CALL(cudaMemcpy(y_h, y, vectorSize, cudaMemcpyDeviceToHost));
     // CUDA_SAFE_CALL(cudaMemcpy(col_indices_h, col_indices, allocSize_int, cudaMemcpyDeviceToHost));
     CUDA_SAFE_CALL(cudaMemcpy(row_offset_h, row_offset, row_offset_size, cudaMemcpyDeviceToHost));
     CUDA_SAFE_CALL(cudaMemcpy(values_h, value, allocSize, cudaMemcpyDeviceToHost));
@@ -315,14 +318,14 @@ int main(int argc, char **argv){
     // printf("\nBiggest Error: %f\n\n\n",errorCal(y_h,y_h_gold));
 
     // Free-up device and host memory
-    CUDA_SAFE_CALL(cudaFree(y));
+    // CUDA_SAFE_CALL(cudaFree(y));
     CUDA_SAFE_CALL(cudaFree(value));
     // CUDA_SAFE_CALL(cudaFree(x));
     // CUDA_SAFE_CALL(cudaFree(col_indices));
     CUDA_SAFE_CALL(cudaFree(row_offset));
 
 
-    free(y_h);
+    // free(y_h);
     free(values_h);
     // free(col_indices_h);
     free(row_offset_h);
