@@ -29,74 +29,104 @@ inline void gpuAssert(cudaError_t code, char *file, int line, bool abort=true)
 // #define TILE_WIDTH 16
 #define SPARSITY 0.05
 #define FULL_MASK 0xffffffff
+#define warp_size 32
 
 typedef float data_t;
 
 void initializeArray1D(float *arr, int len, float seed);
 void initializeSparseMatrixCSR(int *row_offset, int len, int *col_indices, float *values, float seed);
 
-
+//using one thread per matrix row
 __global__ void edge_softmax_forward(int *row_off, float *val, float *y)
 {
-    int row = blockDim.y * blockIdx.y + threadIdx.y;
-    int numOfRows = SM_ARR_LEN / BLOCK_SIZE;
-    int i, j, k, l;
+    int row = blockDim.x * blockIdx.x + threadIdx.x;
+    // int blockId = gridDim.x * gridDimId.x + blockIdx.x;
+    int num_Rows = SM_ARR_LEN / BLOCK_SIZE;
+    int i, k, l;
     float max_score = -INFINITY, exp_sum = 0.0f; 
-    int start = row_off[row], end = row_off[row + 1];   
+      
+    if (row < num_Rows) {
 
-    if (row < numOfRows) {
-        for (i=0; i < numOfRows; ++i) {
-            //find max edge value
-            for (j=start; j<end; ++j){
-                max_score = fmaxf(max_score, val[j]);
-            }
-            //update edge value && find exp_sum of exp
-            for (k=start; k<end; ++k) {
-                y[k] = expf(val[k] - max_score);
-                exp_sum += y[k];
-            }
-            
-            for (l=start; l<end; ++l) {
-                y[l] = y[l] / exp_sum;
-            }
-        }   
-    }
+        int start = row_off[row] 
+        int end = row_off[row + 1]; 
+
+        //find max edge value for the row
+        for (i=start; i<end; ++i){
+            max_score = fmaxf(max_score, val[j]);
+        }
+        //update edge value && find exp_sum for the row
+        for (k=start; k<end; ++k) {
+            y[k] = expf(val[k] - max_score);
+            exp_sum += y[k];
+        }
+        //output non zero element for the row
+        for (l=start; l<end; ++l) {
+            y[l] = y[l] / exp_sum;
+        }
+    }   
+
 }
 
-__global__ void edge_softmax_forward_warp(int *row_off, float *val, float *y)
+__global__ void edge_softmax_backward(int *row_off, float *val, float *y, int *dZ)
 {
     int row = blockDim.x * blockIdx.x + threadIdx.x;
     int numOfRows = SM_ARR_LEN / BLOCK_SIZE;
-    int i, j, k, l, offset;
-    float max_score = -INFINITY, exp_value = 0.0f, exp_sum = 0.0f; 
-    int start = row_off[row], end = row_off[row + 1];    
+    int i, j;
+    float max_score = -INFINITY, accum = 0.0f; 
 
-    for (i=0; i < numOfRows; ++i) {
-        if (row < numOfRows) {
-            y[row] = 0.0;
-            for (j=start; j<end; j += blockDim.x){
-                max_score = max(max_score, val[j]);
-            }
-            // find the max value among max_score across all threads in warp
-            for (offset = warpSize / 2; offset > 2; offset /= 2) {
-                max_score = max(max_score, __shfl_down_sync(FULL_MASK, max_score, offset));
-            }
+    if (row < numOfRows) {
+
+        int start = row_off[row] 
+        int end = row_off[row + 1]; 
+
+        for (i=start; j<end; ++j){
+            accum += val[i] * dZ[i];
+        }
         
-            for (k = start; k<end; k += blockDim.x) {
-                exp_value = expf(val[k] - max_score);
-                exp_sum += exp_value;
-            }
+        for (j=start; j<end; ++j) {
+            y[j] = (val[j] * dZ[j]) - (val[j] * accum);
+        }
+    }   
+    
+}
 
-            for (offset = warpSize / 2; offset > 2; offset /= 2) {
-                exp_sum += __shfl_down_sync(FULL_MASK, exp_sum, offset);
-            }
-            
-            //normalize edge values using exponential sum
-            for (l=start; l<end; l += blockDim.x) {
-                y[row] = exp_value / exp_sum;
-            }
-        }   
-    }
+//using one warp per matrix row
+__global__ void edge_softmax_forward_warp(int *row_off, float *val, float *y)
+{
+    int thread_id = blockDim.x * blockIdx.x + threadIdx.x;// global thread index
+    // int warp_id = thread_id / 32; // global warp index
+    // int lane = thread_id & (32 - 1); // thread index within the warp
+    int numOfRows = SM_ARR_LEN / BLOCK_SIZE;
+    int i, j, k, l, offset;
+    float max_score = -INFINITY, exp_sum = 0.0f; 
+    // int row = warp_id;
+
+    if (row < numOfRows) {
+        int start = row_off[row] 
+        int end = row_off[row + 1]; 
+
+        for (j=start; j<end; j += warp_size){
+            max_score = fmaxf(max_score, val[j]);
+        }
+        // find the max value among max_score across all threads in warp
+        for (offset = warp_size / 2; offset > 0; offset /= 2) {
+            max_score = fmaxf(max_score, __shfl_down_sync(FULL_MASK, max_score, offset));
+        }
+    
+        for (k = start; k<end; k += warp_size) {
+            y[k] = expf(val[k] - max_score);
+            exp_sum += y[k];
+        }
+
+        for (offset = warp_size / 2; offset > 0; offset /= 2) {
+            exp_sum += __shfl_down_sync(FULL_MASK, exp_sum, offset);
+        }
+        
+        //normalize edge values using exponential sum
+        for (l=start; l<end; l += warp_size) {
+            y[l] = y[l] / exp_sum;
+        }
+    }   
 }
 
 
@@ -225,10 +255,13 @@ int main(int argc, char **argv){
     cudaEventCreate(&stop2);
     cudaEventRecord(start2, 0);
 
-    dim3 dimGrid(SM_ARR_LEN, SM_ARR_LEN);
+    dim3 dimGrid(1, 1);
     dim3 dimBlock(BLOCK_SIZE, BLOCK_SIZE);
     // Launch the kernel
-    edge_softmax_forward_warp<<<dimGrid, dimBlock>>>(row_offset, value, y);
+    for (int i = 0; i < SM_ARR_LEN / BLOCK_SIZE; i++) {
+        edge_softmax_forward<<<dimGrid, dimBlock>>>(row_offset, value, y);
+    }
+    
 
     // timer for kernel execution
     cudaEventRecord(stop2,0);
