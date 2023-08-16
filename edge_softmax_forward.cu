@@ -41,7 +41,7 @@ __global__ void edge_softmax_forward(int *row_off, float *val, float *y)
     int row = blockDim.y * blockIdx.y + threadIdx.y;
     int numOfRows = SM_ARR_LEN / BLOCK_SIZE;
     int i, j, k, l;
-    float max_score = -INFINITY, exp_value, exp_sum = 0.0f; 
+    float max_score = -INFINITY, exp_sum = 0.0f; 
     int start = row_off[row], end = row_off[row + 1];                                 
 
     for (i=0; i < numOfRows; ++i) {
@@ -52,13 +52,12 @@ __global__ void edge_softmax_forward(int *row_off, float *val, float *y)
             }
             //update edge value && find exp_sum of exp
             for (k=start; k<end; ++k) {
-                y[k] = val[k] - max_score;
-                exp_value = exp(y[k]);
-                exp_sum += exp_value;
+                y[k] = exp(val[k] - max_score);
+                exp_sum += y[k];
             }
             
             for (l=start; l<end; ++l) {
-                y[l] = exp_value / exp_sum;
+                y[l] = y[l] / exp_sum;
             }
         }   
     }
