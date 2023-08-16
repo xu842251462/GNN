@@ -52,7 +52,7 @@ __global__ void edge_softmax_forward(int *row_off, float *val, float *y)
             }
             //update edge value && find exp_sum of exp
             for (k=start; k<end; ++k) {
-                y[k] = exp(val[k] - max_score);
+                y[k] = expf(val[k] - max_score);
                 exp_sum += y[k];
             }
             
