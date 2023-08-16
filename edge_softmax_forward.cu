@@ -36,48 +36,29 @@ void initializeArray1D(float *arr, int len, float seed);
 void initializeSparseMatrixCSR(int *row_offset, int len, int *col_indices, float *values, float seed);
 
 
-
-// __global__ void SpMV(int *row_off, float *val, int *col, float *y, float *x)
-// {
-//     int row = blockDim.y * blockIdx.y + threadIdx.y;
-//     int numOfRows = SM_ARR_LEN / BLOCK_SIZE;
-//     int i, j;
-//     float sum = 0.0f;                                           
-
-//     for (i=0; i < numOfRows; ++i) {
-//         if (row < numOfRows) {
-//             y[row] = 0.0;
-//             for (j=row_off[row]; j<row_off[row+1]; ++j)
-//                 sum += val[j] * x[col[j]];
-//             y[row] = sum;
-//         }   
-//     }
-// }
-
 __global__ void edge_softmax_forward(int *row_off, float *val, float *y)
 {
-    int row = blockDim.x * blockIdx.x + threadIdx.x;
+    int row = blockDim.y * blockIdx.y + threadIdx.y;
     int numOfRows = SM_ARR_LEN / BLOCK_SIZE;
     int i, j, k, l;
-    float max_score = -INFINITY, exp_value = 0.0f, exp_sum = 0.0f; 
+    float max_score = -INFINITY, exp_value, exp_sum = 0.0f; 
     int start = row_off[row], end = row_off[row + 1];                                 
 
     for (i=0; i < numOfRows; ++i) {
         if (row < numOfRows) {
-            y[row] = 0.0;
             //find max edge value
             for (j=start; j<end; ++j){
                 max_score = fmaxf(max_score, val[j]);
             }
             //update edge value && find exp_sum of exp
             for (k=start; k<end; ++k) {
-                y[row] = val[k] - max_score;
-                exp_value = exp(y[row]);
+                y[k] = val[k] - max_score;
+                exp_value = exp(y[k]);
                 exp_sum += exp_value;
             }
             
             for (l=start; l<end; ++l) {
-                y[row] = exp_value / exp_sum;
+                y[l] = exp_value / exp_sum;
             }
         }   
     }
