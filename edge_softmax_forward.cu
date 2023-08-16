@@ -42,10 +42,10 @@ __global__ void edge_softmax_forward(int *row_off, float *val, float *y)
     int numOfRows = SM_ARR_LEN / BLOCK_SIZE;
     int i, j, k, l;
     float max_score = -INFINITY, exp_sum = 0.0f; 
-    int start = row_off[row], end = row_off[row + 1];                                 
+    int start = row_off[row], end = row_off[row + 1];   
 
-    for (i=0; i < numOfRows; ++i) {
-        if (row < numOfRows) {
+    if (row < numOfRows) {
+        for (i=0; i < numOfRows; ++i) {
             //find max edge value
             for (j=start; j<end; ++j){
                 max_score = fmaxf(max_score, val[j]);
