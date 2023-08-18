@@ -40,7 +40,6 @@ void initializeSparseMatrixCSR(int *row_offset, int len, int *col_indices, float
 __global__ void edge_softmax_forward(int *row_off, float *val, float *y)
 {
     int row = blockDim.x * blockIdx.x + threadIdx.x;
-    // int blockId = gridDim.x * gridDimId.x + blockIdx.x;
     int num_Rows = SM_ARR_LEN / BLOCK_SIZE;
     int i, k, l;
     float max_score = -INFINITY, exp_sum = 0.0f; 
@@ -87,13 +86,13 @@ __global__ void edge_softmax_backward(int *row_off, float *val, float *y, int *d
             y[j] = (val[j] * dZ[j]) - (val[j] * accum);
         }
     }   
-    
 }
 
 //using one warp per matrix row
 __global__ void edge_softmax_forward_warp(int *row_off, float *val, float *y)
 {
-    int thread_id = blockDim.x * blockIdx.x + threadIdx.x;// global thread index
+    int row = blockDim.x * blockIdx.x + threadIdx.x;// global thread index
+    // int laneId = thread_idx.x;
     // int warp_id = thread_id / 32; // global warp index
     // int lane = thread_id & (32 - 1); // thread index within the warp
     int numOfRows = SM_ARR_LEN / BLOCK_SIZE;
@@ -112,6 +111,8 @@ __global__ void edge_softmax_forward_warp(int *row_off, float *val, float *y)
         for (offset = warp_size / 2; offset > 0; offset /= 2) {
             max_score = fmaxf(max_score, __shfl_down_sync(FULL_MASK, max_score, offset));
         }
+        // broadcast max value in the warp from thread 0
+        max_score = __shfl_sync(FULL_MASK, max_score, 0, warp_size);
     
         for (k = start; k<end; k += warp_size) {
             y[k] = expf(val[k] - max_score);
@@ -121,7 +122,9 @@ __global__ void edge_softmax_forward_warp(int *row_off, float *val, float *y)
         for (offset = warp_size / 2; offset > 0; offset /= 2) {
             exp_sum += __shfl_down_sync(FULL_MASK, exp_sum, offset);
         }
-        
+
+        exp_sum = __shfl_sync(FULL_MASK, exp_sum, 0, warp_size);
+
         //normalize edge values using exponential sum
         for (l=start; l<end; l += warp_size) {
             y[l] = y[l] / exp_sum;
